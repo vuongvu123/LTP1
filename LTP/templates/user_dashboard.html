@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Trang User</title>
+  </head>
+  <body>
+    <h2>Xin chào, {{ user.username }} (User)</h2>
+    <p>Số dư hiện tại: <b>{{ user.balance }}</b></p>
+    <p>Trạng thái: {{ 'Đang online' if user.is_online else 'Offline' }}</p>
+
+    <hr />
+    <h3>Gửi yêu cầu nạp tiền</h3>
+    <form method="post" action="{{ url_for('user_request_topup') }}">
+      <label>Số tiền muốn nạp:</label>
+      <input type="number" name="amount" min="1" required />
+      <button type="submit">Gửi yêu cầu</button>
+    </form>
+
+    <h3>Yêu cầu nạp tiền của bạn</h3>
+    <table border="1" cellpadding="5">
+      <tr>
+        <th>ID</th>
+        <th>Số tiền</th>
+        <th>Trạng thái</th>
+        <th>Thời gian</th>
+      </tr>
+      {% for req in requests_list %}
+      <tr>
+        <td>{{ req.id }}</td>
+        <td>{{ req.amount }}</td>
+        <td>{{ req.status }}</td>
+        <td>{{ req.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <hr />
+    <a href="{{ url_for('chat') }}">Chat với admin</a> |
+    <a href="{{ url_for('logout') }}">Đăng xuất</a>
+  </body>
+</html>

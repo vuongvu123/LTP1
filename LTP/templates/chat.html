@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Chat</title>
+  </head>
+  <body>
+    <h2>Phòng chat chung ({{ role }}) - {{ username }}</h2>
+
+    <div
+      style="
+        border: 1px solid #000;
+        padding: 10px;
+        width: 60%;
+        height: 300px;
+        overflow-y: scroll;
+      "
+    >
+      {% for msg in messages %}
+      <p>
+        <b>[{{ msg.role }} - {{ msg.sender }}]</b>: {{ msg.content }}
+        <br /><small>{{ msg.created_at }}</small>
+      </p>
+      <hr />
+      {% endfor %}
+    </div>
+
+    <form method="post" style="margin-top: 10px">
+      <textarea name="content" rows="3" cols="60" required></textarea><br />
+      <button type="submit">Gửi</button>
+    </form>
+
+    <br />
+    {% if role == 'admin' %}
+    <a href="{{ url_for('admin_dashboard') }}">Về trang Admin</a>
+    {% else %}
+    <a href="{{ url_for('user_dashboard') }}">Về trang User</a>
+    {% endif %} |
+    <a href="{{ url_for('logout') }}">Đăng xuất</a>
+  </body>
+</html>

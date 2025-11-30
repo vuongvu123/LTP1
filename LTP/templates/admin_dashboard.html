@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Admin Dashboard</title>
+    <style>
+      body {
+        font-family: Arial;
+      }
+      table {
+        border-collapse: collapse;
+        width: 80%;
+      }
+      th,
+      td {
+        border: 1px solid #444;
+        padding: 6px 10px;
+        text-align: center;
+      }
+      th {
+        background: #eee;
+      }
+      .online {
+        color: green;
+        font-weight: bold;
+      }
+      .btn {
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h2>Xin chào {{ session.username }} (Admin)</h2>
+
+    <!-- Hiển thị thông báo -->
+    {% with messages = get_flashed_messages(with_categories=true) %} {% if
+    messages %}
+    <ul>
+      {% for category, message in messages %}
+      <li style="color: green; font-weight: bold">{{ message }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %} {% endwith %}
+
+    <hr />
+
+    <!-- ======================= -->
+    <!--  TẠO TÀI KHOẢN USER     -->
+    <!-- ======================= -->
+    <h3>⭐ Tạo tài khoản User mới</h3>
+
+    <form method="post" action="{{ url_for('admin_create_user') }}">
+      <input type="text" name="username" placeholder="Username" required />
+      <input type="password" name="password" placeholder="Password" required />
+      <button class="btn" type="submit">Tạo</button>
+    </form>
+
+    <hr />
+
+    <!-- ======================= -->
+    <!--    DANH SÁCH USER       -->
+    <!-- ======================= -->
+    <h3>Danh sách User</h3>
+
+    <table>
+      <tr>
+        <th>ID</th>
+        <th>User</th>
+        <th>Số dư (đ)</th>
+        <th>Trạng thái</th>
+        <th>Nạp tiền</th>
+      </tr>
+
+      {% for u in users %}
+      <tr>
+        <td>{{ u.id }}</td>
+        <td>{{ u.username }}</td>
+
+        <!-- Làm tròn số dư cho đẹp -->
+        <td>{{ '%.0f' % u.balance }}</td>
+
+        <!-- ONLINE CHỈ HIỆN KHI user THẬT SỰ login -->
+        <td>
+          {% if u.is_online == 1 and u.last_active %}
+          <span class="online">Online</span>
+          {% else %} {% endif %}
+        </td>
+
+        <!-- Form nạp tiền -->
+        <td>
+          <form
+            method="post"
+            action="{{ url_for('admin_topup', user_id=u.id) }}"
+          >
+            <input
+              type="number"
+              name="amount"
+              min="1000"
+              placeholder="Số tiền"
+              required
+            />
+            <button class="btn" type="submit">Nạp</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <hr />
+
+    <!-- ======================= -->
+    <!--      YÊU CẦU NẠP TIỀN   -->
+    <!-- ======================= -->
+    <h3>Yêu cầu nạp tiền từ User</h3>
+
+    <table>
+      <tr>
+        <th>ID</th>
+        <th>User</th>
+        <th>Số tiền</th>
+        <th>Trạng thái</th>
+        <th>Thời gian</th>
+        <th>Hành động</th>
+      </tr>
+
+      {% for req in requests_list %}
+      <tr>
+        <td>{{ req.id }}</td>
+        <td>{{ req.username }}</td>
+        <td>{{ req.amount }}</td>
+        <td>{{ req.status }}</td>
+        <td>{{ req.created_at }}</td>
+
+        <td>
+          {% if req.status == 'pending' %}
+          <a href="{{ url_for('admin_approve_request', req_id=req.id) }}"
+            >Duyệt & Nạp</a
+          >
+          {% else %} ✔ Đã xử lý {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <hr />
+
+    <a href="{{ url_for('chat') }}">Chat với User</a> |
+    <a href="{{ url_for('logout') }}">Đăng xuất</a>
+  </body>
+</html>
