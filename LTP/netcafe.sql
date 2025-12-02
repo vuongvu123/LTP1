@@ -49,7 +49,8 @@ CREATE TABLE `topup_requests` (
   `id` int(11) NOT NULL,
   `user_id` int(11) DEFAULT NULL,
   `amount` int(11) DEFAULT NULL,
-  `status` varchar(20) DEFAULT NULL,
+  `status` varchar(20) DEFAULT 'pending',
+  `user_notified` tinyint(1) DEFAULT 0,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
@@ -57,8 +58,8 @@ CREATE TABLE `topup_requests` (
 -- Đang đổ dữ liệu cho bảng `topup_requests`
 --
 
-INSERT INTO `topup_requests` (`id`, `user_id`, `amount`, `status`, `created_at`) VALUES
-(1, 2, 20000, NULL, '2025-11-30 12:07:38');
+INSERT INTO `topup_requests` (`id`, `user_id`, `amount`, `status`, `user_notified`, `created_at`) VALUES
+(1, 2, 20000, 'pending', 0, '2025-11-30 12:07:38');
 
 -- --------------------------------------------------------
 

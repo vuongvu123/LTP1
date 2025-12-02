@@ -1,9 +1,16 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 import pymysql
+from pymysql.err import InternalError
 from datetime import datetime
+
+# Socket.IO for realtime
+from flask_socketio import SocketIO, join_room, leave_room, emit
 
 app = Flask(__name__)
 app.secret_key = "secret_key_cua_ban"
+
+# initialize SocketIO (will choose best async mode available)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Giá tiền 5k / 1 giờ
 COST_PER_HOUR = 5000
@@ -17,12 +24,32 @@ def get_db_connection():
     conn = pymysql.connect(
         host="localhost",
         user="root",
-        password="",
+        password="123456",
         database="netcafe",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True
     )
     return conn
+
+
+# Ensure DB schema has expected columns (run-once safe)
+def ensure_db_schema():
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        # Ensure topup_requests has user_notified column
+        try:
+            cur.execute("SELECT user_notified FROM topup_requests LIMIT 1")
+        except InternalError:
+            cur.execute("ALTER TABLE topup_requests ADD COLUMN user_notified TINYINT(1) DEFAULT 0")
+
+
+# call schema ensure at startup
+ensure_db_schema()
+
+# map user_id -> set of socket ids for connected clients
+active_user_sids = {}
+# map admin socket id -> current target user id
+admin_targets = {}
 
 
 # ============================
@@ -90,6 +117,12 @@ def login():
                     (datetime.now(), user["id"])
                 )
 
+                # emit online status to admin clients
+                try:
+                    socketio.emit('user_status', {'user_id': user['id'], 'is_online': 1}, broadcast=True)
+                except Exception:
+                    pass
+
             if user["role"] == "admin":
                 return redirect(url_for("admin_dashboard"))
             else:
@@ -111,6 +144,21 @@ def logout():
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET is_online=0 WHERE id=%s", (user_id,))
+        # delete all messages involving this user (clear chat between user and admin)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM messages WHERE from_user_id=%s OR to_user_id=%s", (user_id, user_id))
+        except Exception:
+            pass
+
+        try:
+            # notify admin clients to clear conversation with this user
+            socketio.emit('user_status', {'user_id': user_id, 'is_online': 0}, broadcast=True)
+            socketio.emit('clear_chat', {'user_id': user_id}, room='admins')
+            # also notify the user's own room (in case client still connected)
+            socketio.emit('clear_chat', {'user_id': user_id}, room=f"user_{user_id}")
+        except Exception:
+            pass
 
     session.clear()
 
@@ -143,6 +191,15 @@ def user_dashboard():
                     (user_id,))
         requests_list = cur.fetchall()
 
+        # If there are approved requests that haven't been notified to the user, flash and mark them
+        cur.execute("SELECT id, amount FROM topup_requests WHERE user_id=%s AND status='approved' AND user_notified=0",
+                    (user_id,))
+        approved_notified = cur.fetchall()
+        if approved_notified:
+            for r in approved_notified:
+                flash(f"Yêu cầu nạp {int(r['amount'])} đ đã được nạp thành công!", "success")
+                cur.execute("UPDATE topup_requests SET user_notified=1 WHERE id=%s", (r['id'],))
+
     return render_template("user_dashboard.html", user=user, requests_list=requests_list)
 
 
@@ -160,12 +217,26 @@ def user_request_topup():
         return redirect(url_for("user_dashboard"))
 
     amount = int(amount)
+    # enforce minimum topup amount
+    if amount < 5000:
+        flash("Số tiền tối thiểu để nạp là 5000 đ", "danger")
+        return redirect(url_for("user_dashboard"))
     user_id = session["user_id"]
 
     conn = get_db_connection()
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO topup_requests (user_id, amount, status) "
-                    "VALUES (%s, %s, 'pending')", (user_id, amount))
+        cur.execute("INSERT INTO topup_requests (user_id, amount, status, user_notified) "
+                    "VALUES (%s, %s, 'pending', 0)", (user_id, amount))
+        # notify admin clients in real-time about new topup request
+        try:
+            req_id = cur.lastrowid
+            cur.execute("SELECT tr.id, tr.user_id, tr.amount, tr.status, tr.created_at, u.username FROM topup_requests tr JOIN users u ON tr.user_id=u.id WHERE tr.id=%s", (req_id,))
+            new_req = cur.fetchone()
+            if new_req and isinstance(new_req.get('created_at'), datetime):
+                new_req['created_at'] = str(new_req['created_at'])
+            socketio.emit('new_topup_request', new_req, room='admins')
+        except Exception:
+            pass
 
     flash("Đã gửi yêu cầu nạp tiền!", "success")
     return redirect(url_for("user_dashboard"))
@@ -233,7 +304,31 @@ def admin_approve_request(req_id):
         cur.execute("UPDATE users SET balance = balance + %s, last_active=%s WHERE id=%s",
                     (req["amount"], datetime.now(), req["user_id"]))
 
-        cur.execute("UPDATE topup_requests SET status='approved' WHERE id=%s", (req_id,))
+        # mark request approved and ensure user_notified is 0 so user will be notified on next dashboard load
+        cur.execute("UPDATE topup_requests SET status='approved', user_notified=0 WHERE id=%s", (req_id,))
+
+        # insert a message from admin to the user to notify them immediately in chat
+        cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
+        admin_row = cur.fetchone()
+        admin_id = admin_row['id'] if admin_row else None
+        if admin_id:
+            content = f"Yêu cầu nạp {int(req['amount'])} đ của bạn đã được duyệt và nạp vào tài khoản."
+            cur.execute("INSERT INTO messages (from_user_id, to_user_id, content) VALUES (%s, %s, %s)",
+                        (admin_id, req['user_id'], content))
+            # emit real-time notification to the user's room
+            try:
+                socketio.emit('new_message', {
+                    'from_user_id': admin_id,
+                    'to_user_id': req['user_id'],
+                    'content': content
+                }, room=f"user_{req['user_id']}")
+            except Exception:
+                pass
+        # notify admin dashboards that this request was updated
+        try:
+            socketio.emit('topup_request_updated', {'id': req_id, 'status': 'approved'}, room='admins')
+        except Exception:
+            pass
 
     flash("Đã duyệt yêu cầu và nạp tiền!", "success")
     return redirect(url_for("admin_dashboard"))
@@ -291,24 +386,374 @@ def chat():
     role = session["role"]
 
     conn = get_db_connection()
+    # Prepare participants
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
+        admin_row = cur.fetchone()
+        admin_id = admin_row['id'] if admin_row else None
 
+    # ADMIN: optionally choose a user to chat with via query param or form
+    target_user_id = None
+    if session['role'] == 'admin':
+        # get selected user id from querystring or form
+        target_user_id = request.args.get('user_id') or request.form.get('target_user_id')
+        if target_user_id:
+            try:
+                target_user_id = int(target_user_id)
+            except ValueError:
+                target_user_id = None
+
+    # POST handling: insert message with from_user_id/to_user_id
     if request.method == "POST":
         content = request.form.get("content")
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO messages (sender, role, content) VALUES (%s, %s, %s)",
-                (username, role, content)
-            )
+        if session['role'] == 'user':
+            # user -> admin
+            to_id = admin_id
+            from_id = user_id
+        else:
+            # admin -> target user (must provide target_user_id)
+            from_id = user_id
+            to_id = target_user_id
 
+        if from_id and to_id and content:
+            with conn.cursor() as cur:
+                    # if to_id not provided (user sending), find an admin id
+                    if not to_id:
+                        cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
+                        arow = cur.fetchone()
+                        to_id = arow['id'] if arow else None
+                    if not to_id:
+                        # try to find an admin if sender is a user
+                        cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
+                        arow = cur.fetchone()
+                        to_id = arow['id'] if arow else None
+                    if not to_id:
+                        # reject sending messages with no recipient (admin forgot to select user)
+                        try:
+                            emit('error', {'message': 'No recipient selected'}, room=request.sid)
+                        except Exception:
+                            pass
+                        print(f"[socket] message rejected: from={from_id} to=None content={content}")
+                        return
+                    # log resolved recipient
+                    print(f"[socket] resolved to_id={to_id}")
+                    cur.execute("INSERT INTO messages (from_user_id, to_user_id, content) VALUES (%s, %s, %s)",
+                                (from_id, to_id, content))
+
+    # Fetch messages for display
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM messages ORDER BY created_at ASC")
-        messages = cur.fetchall()
+        if session['role'] == 'user':
+            # show conversation between this user and admin
+            cur.execute(
+                "SELECT m.*, u.username AS sender_name, u.role AS sender_role "
+                "FROM messages m JOIN users u ON m.from_user_id = u.id "
+                "WHERE (m.from_user_id=%s AND m.to_user_id=%s) OR (m.from_user_id=%s AND m.to_user_id=%s) "
+                "ORDER BY m.created_at ASC",
+                (user_id, admin_id, admin_id, user_id)
+            )
+            messages = cur.fetchall()
+            # no user list needed for normal user
+            users = []
+        else:
+            # admin: show either conversation with selected user or an empty list
+            # get list of all users for dropdown
+            cur.execute("SELECT id, username FROM users WHERE role='user'")
+            users = cur.fetchall()
 
-    return render_template("chat.html", messages=messages, username=username, role=role)
+            if not target_user_id and users:
+                # default to first user in list
+                target_user_id = users[0]['id']
+
+            if target_user_id:
+                cur.execute(
+                    "SELECT m.*, u.username AS sender_name, u.role AS sender_role "
+                    "FROM messages m JOIN users u ON m.from_user_id = u.id "
+                    "WHERE (m.from_user_id=%s AND m.to_user_id=%s) OR (m.from_user_id=%s AND m.to_user_id=%s) "
+                    "ORDER BY m.created_at ASC",
+                    (user_id, target_user_id, target_user_id, user_id)
+                )
+                messages = cur.fetchall()
+            else:
+                messages = []
+
+    return render_template("chat.html", messages=messages, username=username, role=role, users=users, target_user_id=target_user_id, user_id=user_id)
 
 
 # ============================
 # RUN
 # ============================
+@socketio.on('join')
+def on_join(data):
+    # data: {user_id, role, target_user_id (optional)}
+    user_id = data.get('user_id')
+    role = data.get('role')
+    target = data.get('target_user_id')
+    print(f"[socket] join request: sid={request.sid} user_id={user_id} role={role} target={target}")
+    # Always join the per-user room when a user_id is provided
+    if user_id:
+        room = f"user_{user_id}"
+        try:
+            join_room(room)
+        except Exception:
+            pass
+        # track this sid for direct emits
+        try:
+            s = active_user_sids.get(user_id)
+            if not s:
+                active_user_sids[user_id] = set()
+            active_user_sids[user_id].add(request.sid)
+        except Exception:
+            pass
+        # notify this client it joined its room
+        try:
+            emit('joined', {'room': room, 'user_id': user_id}, room=request.sid)
+        except Exception:
+            pass
+
+    # If role indicates admin, also join admin room and optionally the target user's room
+    if role == 'admin':
+        try:
+            join_room('admins')
+        except Exception:
+            pass
+        # Do NOT auto-join admin to a user's room on connect — admin should explicitly switch users.
+        # Only track the admin's current target if provided, but don't join the user room here.
+        try:
+            if target:
+                admin_targets[request.sid] = target
+        except Exception:
+            pass
+        try:
+            emit('joined', {'room': 'admins', 'target': target, 'user_id': user_id}, room=request.sid)
+        except Exception:
+            pass
+
+
+@socketio.on('switch_user')
+def on_switch_user(data):
+    # admin switches selected user to chat with
+    prev = data.get('prev_user_id')
+    new = data.get('new_user_id')
+    sid = request.sid
+    if prev:
+        try:
+            leave_room(f"user_{prev}")
+        except Exception:
+            pass
+    if new:
+        join_room(f"user_{new}")
+        # remember this admin's current target
+        try:
+            admin_targets[sid] = new
+        except Exception:
+            pass
+        # load conversation and emit back to this admin socket only
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, from_user_id, to_user_id, content, created_at FROM messages WHERE (from_user_id=%s AND to_user_id=%s) OR (from_user_id=%s AND to_user_id=%s) ORDER BY created_at ASC",
+                        (session.get('user_id'), new, new, session.get('user_id')))
+            msgs = cur.fetchall()
+        # convert datetime to string for JSON serialization
+        try:
+            for m in msgs:
+                if isinstance(m.get('created_at'), datetime):
+                    m['created_at'] = str(m['created_at'])
+        except Exception:
+            pass
+        emit('messages', {'messages': msgs}, room=sid)
+
+
+@socketio.on('send_message')
+def on_send_message(data):
+    # data: {from_user_id, to_user_id, content}
+    from_id = data.get('from_user_id')
+    to_id = data.get('to_user_id')
+    content = data.get('content')
+    if not from_id or not content:
+        return
+    print(f"[socket] send_message from={from_id} to={to_id} content={content}")
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        # if to_id not provided, decide based on sender role
+        if not to_id:
+            cur.execute("SELECT role FROM users WHERE id=%s", (from_id,))
+            srow = cur.fetchone()
+            sender_role = srow['role'] if srow else None
+            print(f"[socket] sender_role={sender_role}")
+            if sender_role == 'user':
+                # user sending -> deliver to admin
+                cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
+                arow = cur.fetchone()
+                to_id = arow['id'] if arow else None
+            else:
+                # admin must specify recipient explicitly; try to use admin_targets mapping
+                try:
+                    tgt = admin_targets.get(request.sid)
+                except Exception:
+                    tgt = None
+                if tgt:
+                    to_id = tgt
+                else:
+                    try:
+                        emit('error', {'message': 'Admin must select a recipient'}, room=request.sid)
+                    except Exception:
+                        pass
+                    print(f"[socket] message rejected: from={from_id} to=None content={content}")
+                    return
+        if not to_id:
+            try:
+                emit('error', {'message': 'No recipient available'}, room=request.sid)
+            except Exception:
+                pass
+            print(f"[socket] message rejected: from={from_id} to=None content={content}")
+            return
+        # log resolved recipient
+        print(f"[socket] resolved to_id={to_id}")
+        # prevent rapid duplicate inserts: check for an existing identical message in last 2 seconds
+        msg_id = None
+        created_at = ''
+        try:
+            cur.execute(
+                "SELECT id, created_at FROM messages WHERE from_user_id=%s AND to_user_id=%s AND content=%s AND created_at >= (NOW() - INTERVAL 2 SECOND) LIMIT 1",
+                (from_id, to_id, content)
+            )
+            existing = cur.fetchone()
+            if existing:
+                msg_id = existing['id']
+                created_at = existing['created_at']
+                print(f"[socket] duplicate detected, reusing message id={msg_id}")
+            else:
+                cur.execute("INSERT INTO messages (from_user_id, to_user_id, content) VALUES (%s, %s, %s)",
+                            (from_id, to_id, content))
+                msg_id = cur.lastrowid
+                cur.execute("SELECT created_at FROM messages WHERE id=%s", (msg_id,))
+                crow = cur.fetchone()
+                created_at = crow['created_at'] if crow else ''
+            # get sender info for payload
+            cur.execute("SELECT username, role FROM users WHERE id=%s", (from_id,))
+            srow = cur.fetchone()
+            sender_name = srow['username'] if srow else ''
+            sender_role = srow['role'] if srow else ''
+        except Exception as e:
+            print('[socket] duplicate-check/insert error', e)
+            # fallback: insert normally
+            try:
+                cur.execute("INSERT INTO messages (from_user_id, to_user_id, content) VALUES (%s, %s, %s)",
+                            (from_id, to_id, content))
+                msg_id = cur.lastrowid
+                cur.execute("SELECT created_at FROM messages WHERE id=%s", (msg_id,))
+                crow = cur.fetchone()
+                created_at = crow['created_at'] if crow else ''
+                cur.execute("SELECT username, role FROM users WHERE id=%s", (from_id,))
+                srow = cur.fetchone()
+                sender_name = srow['username'] if srow else ''
+                sender_role = srow['role'] if srow else ''
+            except Exception:
+                msg_id = None
+                created_at = ''
+
+    payload = {
+        'id': msg_id,
+        'from_user_id': from_id,
+        'to_user_id': to_id,
+        'content': content,
+        'sender_name': sender_name,
+        'sender_role': sender_role,
+        'created_at': str(created_at)
+    }
+    # emit to both participants' room so both see it
+    try:
+        socketio.emit('new_message', payload, room=f"user_{to_id}")
+        socketio.emit('new_message', payload, room=f"user_{from_id}")
+    except Exception:
+        print('[socket] emit new_message failed', Exception)
+        pass
+    # ack back to sender socket if available
+    try:
+        emit('sent', payload, room=request.sid)
+    except Exception:
+        pass
+    # also try direct emits to tracked socket ids for reliability
+    try:
+        sids = active_user_sids.get(to_id) or set()
+        print(f"[socket] tracked sids for to_id={to_id}: {len(sids)}")
+        for sid in sids:
+            try:
+                socketio.emit('new_message', payload, room=sid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        sids = active_user_sids.get(from_id) or set()
+        for sid in sids:
+            try:
+                socketio.emit('new_message', payload, room=sid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # notify admins (lightweight) that a user sent a message so admin can see who's active
+    try:
+        # only notify admins when the sender is a non-admin user
+        if sender_role == 'user':
+            notice = {
+                'user_id': from_id,
+                'username': sender_name,
+                'snippet': (content[:80] + '...') if len(content) > 80 else content,
+                'created_at': str(created_at)
+            }
+            socketio.emit('user_active', notice, room='admins')
+    except Exception:
+        pass
+
+
+@socketio.on('load_messages')
+def on_load_messages(data):
+    # data: {user_id, other_id}
+    a = data.get('user_id')
+    b = data.get('other_id')
+    if not a or not b:
+        return
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, from_user_id, to_user_id, content, created_at FROM messages WHERE (from_user_id=%s AND to_user_id=%s) OR (from_user_id=%s AND to_user_id=%s) ORDER BY created_at ASC",
+                    (a, b, b, a))
+        msgs = cur.fetchall()
+    try:
+        for m in msgs:
+            if isinstance(m.get('created_at'), datetime):
+                m['created_at'] = str(m['created_at'])
+    except Exception:
+        pass
+    emit('messages', {'messages': msgs})
+
+
+@socketio.on('disconnect')
+def on_disconnect():
+    sid = request.sid
+    # remove sid from active_user_sids
+    try:
+        to_remove = []
+        for uid, sids in active_user_sids.items():
+            if sid in sids:
+                sids.discard(sid)
+                if not sids:
+                    to_remove.append(uid)
+        for uid in to_remove:
+            active_user_sids.pop(uid, None)
+        print(f"[socket] disconnect sid={sid}")
+    except Exception:
+        pass
+    # remove admin_targets entry if present
+    try:
+        if sid in admin_targets:
+            admin_targets.pop(sid, None)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    # run with socketio to enable realtime features
+    socketio.run(app, debug=True)

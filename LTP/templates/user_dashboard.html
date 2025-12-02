@@ -4,8 +4,16 @@
     <meta charset="UTF-8" />
     <title>Trang User</title>
   </head>
-  <body>
+  <body data-user-id="{{ user.id }}">
     <h2>Xin chào, {{ user.username }} (User)</h2>
+    <!-- Hiển thị thông báo -->
+    {% with messages = get_flashed_messages(with_categories=true) %} {% if messages %}
+    <ul>
+      {% for category, message in messages %}
+      <li style="color: green; font-weight: bold">{{ message }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %} {% endwith %}
     <p>Số dư hiện tại: <b>{{ user.balance }}</b></p>
     <p>Trạng thái: {{ 'Đang online' if user.is_online else 'Offline' }}</p>
 
@@ -38,5 +46,20 @@
     <hr />
     <a href="{{ url_for('chat') }}">Chat với admin</a> |
     <a href="{{ url_for('logout') }}">Đăng xuất</a>
+  
+    <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+    <script>
+      const socket = io();
+      const myId = Number(document.body.dataset.userId);
+      socket.on('connect', function(){
+        socket.emit('join', {user_id: myId, role: 'user'});
+      });
+      socket.on('new_message', function(m){
+        if(m.to_user_id == myId || m.from_user_id == myId){
+          // show a quick alert for notifications (admin approve will send such a message)
+          alert(m.content);
+        }
+      });
+    </script>
   </body>
 </html>

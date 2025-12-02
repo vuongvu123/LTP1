@@ -82,10 +82,10 @@
         <td>{{ '%.0f' % u.balance }}</td>
 
         <!-- ONLINE CHỈ HIỆN KHI user THẬT SỰ login -->
-        <td>
+        <td id="status-{{ u.id }}">
           {% if u.is_online == 1 and u.last_active %}
           <span class="online">Online</span>
-          {% else %} {% endif %}
+          {% else %} Offline {% endif %}
         </td>
 
         <!-- Form nạp tiền -->
@@ -125,28 +125,79 @@
         <th>Hành động</th>
       </tr>
 
+      <tbody id="requestsBody">
       {% for req in requests_list %}
-      <tr>
+      <tr id="req-{{ req.id }}">
         <td>{{ req.id }}</td>
         <td>{{ req.username }}</td>
         <td>{{ req.amount }}</td>
-        <td>{{ req.status }}</td>
+        <td class="status-cell">{{ req.status }}</td>
         <td>{{ req.created_at }}</td>
 
-        <td>
+        <td class="action-cell">
           {% if req.status == 'pending' %}
-          <a href="{{ url_for('admin_approve_request', req_id=req.id) }}"
-            >Duyệt & Nạp</a
-          >
+          <a href="{{ url_for('admin_approve_request', req_id=req.id) }}">Duyệt & Nạp</a>
           {% else %} ✔ Đã xử lý {% endif %}
         </td>
       </tr>
       {% endfor %}
+      </tbody>
     </table>
 
     <hr />
 
     <a href="{{ url_for('chat') }}">Chat với User</a> |
     <a href="{{ url_for('logout') }}">Đăng xuất</a>
+  
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+  <script id="server-data" type="application/json">
+    {{ {'user_id': session.user_id, 'role': 'admin'} | tojson }}
+  </script>
+  <script>
+    const socket = io();
+    const serverData = JSON.parse(document.getElementById('server-data').textContent || 'null');
+    console.log('[admin] serverData', serverData);
+    socket.on('connect', function(){
+      // join as admin so this page receives admin-room events
+      console.log('[admin] emitting join', serverData);
+      socket.emit('join', serverData);
+    });
+    socket.on('user_status', function(p){
+      const el = document.getElementById('status-' + p.user_id);
+      if(el){
+        if(p.is_online == 1){
+          el.innerHTML = '<span class="online">Online</span>';
+        } else {
+          el.innerText = 'Offline';
+        }
+      }
+    });
+    // handle new topup requests in realtime
+    socket.on('new_topup_request', function(r){
+      try{
+        const tbody = document.getElementById('requestsBody');
+        if(!tbody) return;
+        const tr = document.createElement('tr');
+        tr.id = 'req-' + r.id;
+        tr.innerHTML = `<td>${r.id}</td><td>${r.username}</td><td>${r.amount}</td><td class="status-cell">${r.status}</td><td>${r.created_at}</td><td class="action-cell">` +
+          (r.status=='pending' ? `<a href="/admin/approve_request/${r.id}">Duyệt & Nạp</a>` : '✔ Đã xử lý') + `</td>`;
+        // insert at top
+        if(tbody.firstChild) tbody.insertBefore(tr, tbody.firstChild);
+        else tbody.appendChild(tr);
+      }catch(e){console.error(e)}
+    });
+
+    // handle updates to topup requests
+    socket.on('topup_request_updated', function(u){
+      try{
+        const row = document.getElementById('req-' + u.id);
+        if(!row) return;
+        const statusCell = row.querySelector('.status-cell');
+        const actionCell = row.querySelector('.action-cell');
+        if(statusCell) statusCell.innerText = u.status;
+        if(actionCell) actionCell.innerHTML = '✔ Đã xử lý';
+      }catch(e){console.error(e)}
+    });
+  </script>
   </body>
 </html>

@@ -3,11 +3,72 @@
   <head>
     <meta charset="UTF-8" />
     <title>Chat</title>
+    <style>
+      /* Global styles for message alignment and bubbles */
+      .msger-messages { display:flex; flex-direction:column; gap:6px; }
+      .msg-row { display:flex; align-items:flex-end; margin:6px 0; }
+      .msg-row.incoming { justify-content:flex-start; }
+      .msg-row.outgoing { justify-content:flex-end; }
+      .msg-bubble { max-width:70%; padding:8px 12px; border-radius:12px; word-break:break-word; }
+      .msg-bubble.incoming { background:#f1f0f0; color:#000; border-top-left-radius:4px; }
+      .msg-bubble.outgoing { background:#0b93f6; color:#fff; border-top-right-radius:4px; }
+      .msg-time { display:block; font-size:0.75em; color:#666; margin-top:4px; }
+    </style>
   </head>
-  <body>
-    <h2>Phòng chat chung ({{ role }}) - {{ username }}</h2>
+  <body data-user-id="{{ user_id | tojson }}" data-role="{{ role | tojson }}" data-target-user-id="{{ (target_user_id if target_user_id else none) | tojson }}">
+    <h2>Phòng chat ({{ role }}) - {{ username }}</h2>
 
-    <div
+    {% if role == 'admin' %}
+
+    <style>
+      .messenger { display:flex; gap:12px; }
+      .msger-list { width:28%; border:1px solid #ccc; height:420px; overflow:auto; padding:8px; }
+      .msger-item { padding:8px; cursor:pointer; border-bottom:1px solid #eee; }
+      .msger-item { position:relative; }
+      .notify-badge { position:absolute; right:8px; top:10px; background:#e53935; color:#fff; width:18px; height:18px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:12px; line-height:1; }
+      .msger-item.notify { background:#fff5f5; }
+      .msger-item.selected { background:#f0f8ff; }
+      .msger-chat { flex:1; border:1px solid #ccc; height:420px; display:flex; flex-direction:column; }
+      .msger-messages { flex:1; padding:10px; overflow-y:auto; }
+      .msger-input { padding:8px; border-top:1px solid #eee; }
+      .online-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:gray; }
+      .online-dot.on { background:green; }
+    </style>
+
+    <div class="messenger">
+      <div class="msger-list" id="msgerList">
+        {% for u in users %}
+        <div class="msger-item {% if target_user_id and u.id==target_user_id %}selected{% endif %}" data-user-id="{{ u.id }}">
+          <span class="online-dot {% if u.is_online==1 %}on{% endif %}" id="dot-{{ u.id }}"></span>
+          <span class="msger-username">{{ u.username }}</span>
+          <span class="notify-badge" id="badge-{{ u.id }}" style="display:none"></span>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="msger-chat">
+        <div class="msger-messages" id="chatBox">
+          {% for msg in messages %}
+          <div class="msg-row {% if msg.from_user_id == user_id %}outgoing{% else %}incoming{% endif %}">
+            <div class="msg-bubble {% if msg.from_user_id == user_id %}outgoing{% else %}incoming{% endif %}">
+              <b>[{{ msg.sender_role }} - {{ msg.sender_name }}]</b>
+              <div>{{ msg.content }}</div>
+              <small class="msg-time">{{ msg.created_at }}</small>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="msger-input">
+          <textarea id="messageInput" rows="3" style="width:100%;" required></textarea><br />
+          <button id="sendBtn">Gửi</button>
+        </div>
+      </div>
+    </div>
+
+    {% else %}
+
+    <div id="chatBox"
       style="
         border: 1px solid #000;
         padding: 10px;
@@ -17,18 +78,22 @@
       "
     >
       {% for msg in messages %}
-      <p>
-        <b>[{{ msg.role }} - {{ msg.sender }}]</b>: {{ msg.content }}
-        <br /><small>{{ msg.created_at }}</small>
-      </p>
-      <hr />
+      <div class="msg-row {% if msg.from_user_id == user_id %}outgoing{% else %}incoming{% endif %}">
+        <div class="msg-bubble {% if msg.from_user_id == user_id %}outgoing{% else %}incoming{% endif %}">
+          <b>[{{ msg.sender_role }} - {{ msg.sender_name }}]</b>
+          <div>{{ msg.content }}</div>
+          <small class="msg-time">{{ msg.created_at }}</small>
+        </div>
+      </div>
       {% endfor %}
     </div>
 
-    <form method="post" style="margin-top: 10px">
-      <textarea name="content" rows="3" cols="60" required></textarea><br />
-      <button type="submit">Gửi</button>
-    </form>
+    <div style="margin-top: 10px">
+      <textarea id="messageInput" rows="3" cols="60" required></textarea><br />
+      <button id="sendBtn">Gửi</button>
+    </div>
+
+    {% endif %}
 
     <br />
     {% if role == 'admin' %}
@@ -37,5 +102,200 @@
     <a href="{{ url_for('user_dashboard') }}">Về trang User</a>
     {% endif %} |
     <a href="{{ url_for('logout') }}">Đăng xuất</a>
+  
+  <!-- Socket.IO client -->
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+  <script>
+    // read server-rendered values from body data attributes to avoid editor parse errors for template tags
+    const userId = JSON.parse(document.body.getAttribute('data-user-id') || 'null');
+    const role = JSON.parse(document.body.getAttribute('data-role') || 'null');
+    let targetUserId = JSON.parse(document.body.getAttribute('data-target-user-id') || 'null');
+
+    const socket = io();
+
+    socket.on('connect', function(){
+      // compute role fallback: if there's a userSelect element it's admin view
+      let roleValue = role;
+      if(!roleValue){
+        roleValue = document.getElementById('msgerList') ? 'admin' : 'user';
+      }
+      // do not send target_user_id when admin initially connects; admin will switch users explicitly
+      if(roleValue === 'admin'){
+        console.log('[socket] connect, emitting join (admin)', {user_id: userId, role: roleValue});
+        socket.emit('join', {user_id: userId, role: roleValue});
+      } else {
+        // user view: include targetUserId if present (usually null)
+        console.log('[socket] connect, emitting join', {user_id: userId, role: roleValue, target_user_id: targetUserId});
+        socket.emit('join', {user_id: userId, role: roleValue, target_user_id: targetUserId});
+      }
+    });
+
+    // debug: confirm server-side join
+    socket.on('joined', function(info){
+      console.log('[socket] joined', info);
+    });
+
+    // when an user is active (sent a message), admin dashboards receive a lightweight notice
+    socket.on('user_active', function(p){
+      try{
+        // only apply to admin UI (msger list exists)
+        const list = document.getElementById('msgerList');
+        if(!list) return;
+        const item = document.querySelector('.msger-item[data-user-id="' + p.user_id + '"]');
+        if(item){
+          // show badge and highlight
+          const badge = document.getElementById('badge-' + p.user_id);
+          if(badge){ badge.style.display = 'inline-flex'; badge.innerText = '•'; }
+          item.classList.add('notify');
+        } else {
+          // if user not present in list (unlikely), we could refresh list later
+          console.log('user_active for unknown user', p.user_id);
+        }
+      }catch(e){console.error(e)}
+    });
+
+    // debug: ack of sent message
+    socket.on('sent', function(payload){
+      console.log('[socket] sent ack', payload);
+    });
+
+    const chatBox = document.getElementById('chatBox');
+    const sendBtn = document.getElementById('sendBtn');
+    const messageInput = document.getElementById('messageInput');
+    const seenMessageIds = new Set();
+
+    function appendMessage(m){
+      // de-duplicate messages by id when possible
+      if(m && m.id){
+        if(seenMessageIds.has(m.id)) return;
+        seenMessageIds.add(m.id);
+      }
+      // determine side: outgoing (sent by this client) on the right, incoming on the left
+      let side = 'incoming';
+      if(m && typeof m.from_user_id !== 'undefined'){
+        side = (m.from_user_id === userId) ? 'outgoing' : 'incoming';
+      } else if(m && m.sender_role){
+        // fallback: treat messages with same role as this client as outgoing
+        side = (m.sender_role === role) ? 'outgoing' : 'incoming';
+      }
+
+      const row = document.createElement('div');
+      row.className = 'msg-row ' + side;
+      const bubble = document.createElement('div');
+      bubble.className = 'msg-bubble ' + side;
+      const senderLabel = (m && (m.sender_role || m.sender_name)) ? `[${m.sender_role || ''} - ${m.sender_name || ''}]` : '';
+      bubble.innerHTML = `<strong>${senderLabel}</strong><div>${m.content || ''}</div><small class="msg-time">${m.created_at || ''}</small>`;
+      row.appendChild(bubble);
+      chatBox.appendChild(row);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    // receive a single new message
+    socket.on('new_message', function(m){
+      // if the message belongs to current conversation, append
+      const otherId = (m.from_user_id == userId) ? m.to_user_id : m.from_user_id;
+      if(role === 'admin'){
+        if(!targetUserId) return;
+        if(otherId == targetUserId || m.to_user_id == targetUserId || m.from_user_id == targetUserId){
+          appendMessage(m);
+        }
+      } else {
+        // user: any message to/from admin
+        appendMessage(m);
+      }
+    });
+
+    // receive full messages list
+    socket.on('messages', function(payload){
+      chatBox.innerHTML = '';
+      seenMessageIds.clear();
+      payload.messages.forEach(function(m){
+        appendMessage(m);
+      });
+    });
+
+    // clear chat when server requests (e.g., user logged out and messages deleted)
+    socket.on('clear_chat', function(data){
+      if(role === 'admin'){
+        // if deleted user equals current target, clear chat
+        if(data.user_id == targetUserId){
+          chatBox.innerHTML = '';
+          alert('Đoạn chat với user đã bị xoá (user đã đăng xuất).');
+        }
+        // also remove user from left list
+        const item = document.querySelector('.msger-item[data-user-id="' + data.user_id + '"]');
+        if(item) item.remove();
+      } else {
+        if(data.user_id == userId){
+          chatBox.innerHTML = '';
+          alert('Đoạn chat của bạn đã bị xoá khi đăng xuất.');
+        }
+      }
+    });
+
+    sendBtn.addEventListener('click', function(e){
+      e.preventDefault();
+      const content = messageInput.value.trim();
+      if(!content) return;
+      let toId = null;
+      if(role === 'user'){
+        // to admin: server will infer admin if to_user_id is null
+      }
+      if(role === 'admin'){
+        // ensure we have a target user id; fall back to msger list selection if needed
+        if(!targetUserId){
+          const selItem = document.querySelector('.msger-item.selected') || document.querySelector('.msger-item');
+          if(selItem) targetUserId = parseInt(selItem.getAttribute('data-user-id'));
+        }
+        if(!targetUserId){
+          alert('Chưa chọn user để chat');
+          return;
+        }
+        toId = targetUserId;
+      }
+      const payload = {from_user_id: userId, to_user_id: toId, content: content};
+      console.log('[socket] emit send_message', payload);
+      socket.emit('send_message', payload);
+      // don't optimistically append — wait for server 'new_message' / 'sent' to avoid duplicates
+      messageInput.value = '';
+      // briefly disable send to avoid double-clicks
+      sendBtn.disabled = true;
+      setTimeout(() => sendBtn.disabled = false, 500);
+    });
+
+    // admin selects user from list
+    const msgerList = document.getElementById('msgerList');
+    if(msgerList){
+      msgerList.addEventListener('click', function(e){
+        let el = e.target;
+        while(el && !el.classList.contains('msger-item')) el = el.parentElement;
+        if(!el) return;
+        const newId = parseInt(el.getAttribute('data-user-id'));
+        const prev = targetUserId;
+        if(prev === newId) return;
+        // mark selected
+        document.querySelectorAll('.msger-item').forEach(i=>i.classList.remove('selected'));
+        el.classList.add('selected');
+        targetUserId = newId;
+        socket.emit('switch_user', {prev_user_id: prev, new_user_id: newId});
+        // clear notify badge when admin opens the conversation
+        try{
+          const badge = document.getElementById('badge-' + newId);
+          if(badge){ badge.style.display='none'; badge.innerText=''; }
+          const item = document.querySelector('.msger-item[data-user-id="' + newId + '"]');
+          if(item) item.classList.remove('notify');
+        }catch(e){console.error(e)}
+      });
+    }
+    // update online dot when user status changes
+    socket.on('user_status', function(p){
+      try{
+        const dot = document.getElementById('dot-' + p.user_id);
+        if(dot){
+          if(p.is_online == 1) dot.classList.add('on'); else dot.classList.remove('on');
+        }
+      }catch(e){console.error(e)}
+    });
+  </script>
   </body>
 </html>
