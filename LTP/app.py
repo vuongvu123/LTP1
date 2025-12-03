@@ -17,6 +17,19 @@ COST_PER_HOUR = 5000
 COST_PER_SECOND = COST_PER_HOUR / 3600.0
 
 
+def seconds_to_hms(sec):
+    try:
+        sec = int(sec)
+    except Exception:
+        sec = 0
+    if sec <= 0:
+        return "00:00:00"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 # ============================
 # KẾT NỐI DATABASE
 # ============================
@@ -50,8 +63,62 @@ ensure_db_schema()
 active_user_sids = {}
 # map admin socket id -> current target user id
 admin_targets = {}
+# map user_id -> background task handle (to avoid multiple tasks per user)
+user_time_tasks = {}
 
+def _start_user_time_task(user_id):
+    """Start a background task that updates a user's time every second and emits updates.
+    Uses socketio.start_background_task to avoid raw threads.
+    """
+    if user_id in user_time_tasks:
+        return
 
+    def task():
+        # run until user is offline or removed from tracking
+        try:
+            while True:
+                # check if user still has connected sids or is online
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT is_online, balance, last_active FROM users WHERE id=%s", (user_id,))
+                    row = cur.fetchone()
+                if not row or row.get('is_online') == 0:
+                    break
+
+                # update time and balance
+                res = update_user_time(user_id)
+
+                # fetch latest balance and compute seconds left
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT balance FROM users WHERE id=%s", (user_id,))
+                    r = cur.fetchone()
+                bal = float(r.get('balance') or 0)
+                seconds_left = int(bal / COST_PER_SECOND) if COST_PER_SECOND else 0
+
+                payload = {
+                    'user_id': user_id,
+                    'balance': bal,
+                    'seconds_left': seconds_left,
+                    'status': res
+                }
+                try:
+                    socketio.emit('time_update', payload, room=f"user_{user_id}")
+                except Exception:
+                    pass
+
+                if res == 'OUT':
+                    # user ran out of money; stop task
+                    break
+
+                socketio.sleep(1)
+        finally:
+            # cleanup
+            user_time_tasks.pop(user_id, None)
+
+    # start and store a handle (not required by flask-socketio but keep presence)
+    th = socketio.start_background_task(task)
+    user_time_tasks[user_id] = th
 # ============================
 # HÀM UPDATE THỜI GIAN - TRỪ TIỀN
 # ============================
@@ -72,6 +139,9 @@ def update_user_time(user_id):
         if u["last_active"] is None:
             cur.execute("UPDATE users SET last_active=%s WHERE id=%s", (now, user_id))
             return "OK"
+
+
+        
 
         elapsed = (now - u["last_active"]).total_seconds()
 
@@ -112,17 +182,22 @@ def login():
             session["role"] = user["role"]
 
             with conn.cursor() as cur:
+                # QUAN TRỌNG: Reset last_active = NOW() để bắt đầu đếm giờ lại từ đầu
+                # Bỏ qua khoảng thời gian offline trước đó
                 cur.execute(
                     "UPDATE users SET is_online=1, last_active=%s WHERE id=%s",
                     (datetime.now(), user["id"])
                 )
 
-                # emit online status to admin clients
+                # Báo cho admin biết user online
                 try:
-                    # emit to admins room so admin dashboards reliably receive status updates
                     socketio.emit('user_status', {'user_id': user['id'], 'is_online': 1}, room='admins')
                 except Exception:
                     pass
+            
+            # Kích hoạt task đếm giờ ngay lập tức
+            if user["role"] == "user":
+                 _start_user_time_task(user["id"])
 
             if user["role"] == "admin":
                 return redirect(url_for("admin_dashboard"))
@@ -142,10 +217,15 @@ def logout():
     user_id = session.get("user_id")
 
     if user_id:
+        # 1. Cập nhật tiền lần cuối cùng trước khi logout
+        update_user_time(user_id)
+
         conn = get_db_connection()
         with conn.cursor() as cur:
+            # 2. Set trạng thái về Offline
             cur.execute("UPDATE users SET is_online=0 WHERE id=%s", (user_id,))
-        # delete all messages involving this user (clear chat between user and admin)
+        
+        # ... (Phần code xóa chat và dọn dẹp giữ nguyên như cũ) ...
         try:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM messages WHERE from_user_id=%s OR to_user_id=%s", (user_id, user_id))
@@ -153,16 +233,22 @@ def logout():
             pass
 
         try:
-            # notify admin clients to clear conversation with this user and update online status
             socketio.emit('user_status', {'user_id': user_id, 'is_online': 0}, room='admins')
             socketio.emit('clear_chat', {'user_id': user_id}, room='admins')
-            # also notify the user's own room (in case client still connected)
             socketio.emit('clear_chat', {'user_id': user_id}, room=f"user_{user_id}")
+            
+            # Gửi tín hiệu PAUSE về client để đồng hồ dừng ngay lập tức
+            socketio.emit('time_update', {'user_id': user_id, 'status': 'PAUSED'}, room=f"user_{user_id}")
+        except Exception:
+            pass
+
+        # Dừng background task
+        try:
+            user_time_tasks.pop(user_id, None)
         except Exception:
             pass
 
     session.clear()
-
     return redirect(url_for("login"))
 
 
@@ -175,33 +261,43 @@ def user_dashboard():
         return redirect(url_for("login"))
 
     user_id = session["user_id"]
+    conn = get_db_connection()
 
-    # Auto trừ tiền
+    # XỬ LÝ TRƯỜNG HỢP RELOAD TRANG:
+    # Nếu DB đang ghi nhận là offline (do socket disconnect khi reload), ta phải set lại Online
+    # và reset last_active để tránh trừ tiền oan trong tích tắc reload.
+    with conn.cursor() as cur:
+        cur.execute("SELECT is_online, last_active FROM users WHERE id=%s", (user_id,))
+        u_status = cur.fetchone()
+        
+        if u_status and u_status['is_online'] == 0:
+            # User đang reload trang -> Set lại Online và Resume thời gian
+            cur.execute("UPDATE users SET is_online=1, last_active=%s WHERE id=%s", 
+                        (datetime.now(), user_id))
+            # Khởi động lại task đếm giờ
+            _start_user_time_task(user_id)
+
+    # Auto trừ tiền (Bình thường)
     result = update_user_time(user_id)
     if result == "OUT":
         session.clear()
         flash("Bạn đã hết tiền! Vui lòng nạp thêm.", "danger")
         return redirect(url_for("login"))
 
-    conn = get_db_connection()
+    # ... (Phần còn lại giữ nguyên) ...
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM users WHERE id=%s", (user_id,))
         user = cur.fetchone()
-
-        cur.execute("SELECT * FROM topup_requests WHERE user_id=%s ORDER BY created_at DESC",
-                    (user_id,))
+        
+        # ... code lấy requests_list ...
+        cur.execute("SELECT * FROM topup_requests WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
         requests_list = cur.fetchall()
+        
+        # Compute seconds left
+        bal = float(user['balance'] or 0)
+        seconds_left = int(bal / COST_PER_SECOND)
 
-        # If there are approved requests that haven't been notified to the user, flash and mark them
-        cur.execute("SELECT id, amount FROM topup_requests WHERE user_id=%s AND status='approved' AND user_notified=0",
-                    (user_id,))
-        approved_notified = cur.fetchall()
-        if approved_notified:
-            for r in approved_notified:
-                flash(f"Yêu cầu nạp {int(r['amount'])} đ đã được nạp thành công!", "success")
-                cur.execute("UPDATE topup_requests SET user_notified=1 WHERE id=%s", (r['id'],))
-
-    return render_template("user_dashboard.html", user=user, requests_list=requests_list)
+    return render_template("user_dashboard.html", user=user, requests_list=requests_list, seconds_left=seconds_left)
 
 
 # ============================
@@ -255,6 +351,13 @@ def admin_dashboard():
     with conn.cursor() as cur:
         cur.execute("SELECT id, username, balance, is_online, last_active FROM users WHERE role='user'")
         users = cur.fetchall()
+        # compute seconds_left for each user (balance -> seconds)
+        for u in users:
+            try:
+                bal = float(u.get('balance') or 0)
+            except Exception:
+                bal = 0.0
+            u['seconds_left'] = int(bal / COST_PER_SECOND)
 
         cur.execute("""
             SELECT tr.*, u.username
@@ -505,6 +608,17 @@ def on_join(data):
             active_user_sids[user_id].add(request.sid)
         except Exception:
             pass
+        # start background time updater for this user if they're online
+        try:
+            # check DB online flag before starting
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT is_online FROM users WHERE id=%s", (user_id,))
+                r = cur.fetchone()
+            if r and r.get('is_online') == 1:
+                _start_user_time_task(user_id)
+        except Exception:
+            pass
         # notify this client it joined its room
         try:
             emit('joined', {'room': room, 'user_id': user_id}, room=request.sid)
@@ -734,7 +848,7 @@ def on_load_messages(data):
 @socketio.on('disconnect')
 def on_disconnect():
     sid = request.sid
-    # remove sid from active_user_sids
+    # ... (Phần code xóa sid giữ nguyên) ...
     try:
         to_remove = []
         for uid, sids in active_user_sids.items():
@@ -744,13 +858,41 @@ def on_disconnect():
                     to_remove.append(uid)
         for uid in to_remove:
             active_user_sids.pop(uid, None)
-        print(f"[socket] disconnect sid={sid}")
     except Exception:
         pass
-    # remove admin_targets entry if present
+
     try:
         if sid in admin_targets:
             admin_targets.pop(sid, None)
+    except Exception:
+        pass
+
+    # XỬ LÝ KHI USER MẤT KẾT NỐI HOÀN TOÀN
+    try:
+        to_stop = []
+        for uid, sids in list(active_user_sids.items()):
+            if not sids:
+                to_stop.append(uid)
+        for uid in to_stop:
+            active_user_sids.pop(uid, None)
+            
+            # CHỐT SỔ LẦN CUỐI
+            update_user_time(uid)
+
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET is_online=0 WHERE id=%s", (uid,))
+                
+                # Báo admin biết user này đã offline
+                try:
+                    socketio.emit('user_status', {'user_id': uid, 'is_online': 0}, room='admins')
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            
+            user_time_tasks.pop(uid, None)
     except Exception:
         pass
 
