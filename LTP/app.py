@@ -119,7 +119,8 @@ def login():
 
                 # emit online status to admin clients
                 try:
-                    socketio.emit('user_status', {'user_id': user['id'], 'is_online': 1}, broadcast=True)
+                    # emit to admins room so admin dashboards reliably receive status updates
+                    socketio.emit('user_status', {'user_id': user['id'], 'is_online': 1}, room='admins')
                 except Exception:
                     pass
 
@@ -152,8 +153,8 @@ def logout():
             pass
 
         try:
-            # notify admin clients to clear conversation with this user
-            socketio.emit('user_status', {'user_id': user_id, 'is_online': 0}, broadcast=True)
+            # notify admin clients to clear conversation with this user and update online status
+            socketio.emit('user_status', {'user_id': user_id, 'is_online': 0}, room='admins')
             socketio.emit('clear_chat', {'user_id': user_id}, room='admins')
             # also notify the user's own room (in case client still connected)
             socketio.emit('clear_chat', {'user_id': user_id}, room=f"user_{user_id}")
